@@ -1,7 +1,7 @@
 {
   "name": "ga4-uniapp",
   "type": "module",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "packageManager": "bun@1.3.14",
   "description": "GA4 direct-collect client for uni-app.",
   "author": "censujiang",
