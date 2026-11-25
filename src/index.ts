@@ -6,6 +6,10 @@ import "core-js/actual/url-search-params"
 export const GA4_COLLECT_ENDPOINT = "https://www.google-analytics.com/g/collect"
 
 const defaultSessionTimeoutMs = 30 * 60 * 1000
+const defaultRequestTimeoutMs = 10 * 1000
+const defaultMaxQueueSize = 100
+const defaultRetryDelaysMs = [2000, 5000, 15000, 30000, 60000]
+const defaultMaxPendingAgeMs = 24 * 60 * 60 * 1000
 const defaultStoragePrefix = "uni_ga4"
 const defaultAppOrigin = "https://uniapp.local"
 const fileExtensionPattern = /^(pdf|xlsx?|docx?|txt|rtf|csv|exe|key|pp(s|t|tx)|7z|pkg|rar|gz|zip|avi|mov|mp4|mpe?g|wmv|midi?|mp3|wav|wma)$/i
@@ -38,6 +42,8 @@ export type UniGA4HttpRequest = {
   method: "GET" | "POST"
   eventName: string
   params: Record<string, string>
+  /** Per-request timeout requested by the client (see `requestTimeoutMs`). Custom adapters should honor it. */
+  timeoutMs?: number
 }
 
 /** Result returned by a custom transport adapter. */
@@ -169,6 +175,26 @@ export interface CreateUniAppGA4Config {
   sessionTimeoutMs?: number
   /** Optional debounce window for batching queued hits. `0` sends immediately. */
   batchIntervalMs?: number
+  /**
+   * Per-request timeout in milliseconds for the default `uni.request` transport.
+   *
+   * Defaults to 10 seconds, so a blocked or black-holed network path fails fast and the hit is retried
+   * instead of hanging for the platform default (typically 60 seconds).
+   */
+  requestTimeoutMs?: number
+  /** Maximum number of undelivered hits kept in memory/storage. The oldest hits are dropped first. Defaults to 100. */
+  maxQueueSize?: number
+  /**
+   * Delays in milliseconds between delivery retries after a failed request; the last value repeats.
+   *
+   * Defaults to `[2000, 5000, 15000, 30000, 60000]`. Pass an empty array to disable timed retries
+   * (undelivered hits are still retried on the next flush trigger).
+   */
+  retryDelaysMs?: number[]
+  /** Persist undelivered hits through uni storage so they survive app restarts. Defaults to `true`. */
+  persistQueue?: boolean
+  /** Drop undelivered hits older than this many milliseconds instead of retrying them. Defaults to 24 hours. */
+  maxPendingAgeMs?: number
   /** Storage key prefix for client ID, user ID, opt-out state, and session state. */
   storagePrefix?: string
   /**
@@ -248,12 +274,25 @@ type StoredSession = {
   number: number
   startedAt: number
   lastEngagementTs: number
+  /** `true` once the first hit of this session (carrying `_ss`/`_nsi`) has been queued. */
+  startSent?: boolean
+}
+
+/** Session markers gtag.js attaches to the first hit of a session / client so GA4 can derive `session_start` and `first_visit`. */
+type QueuedEventFlags = {
+  /** `_ss=1`: this hit starts a session. */
+  ss?: boolean
+  /** `_nsi=1`: this hit carries a new session id. */
+  nsi?: boolean
+  /** `_fv=1`: this hit is the first ever visit of a brand-new client. */
+  fv?: boolean
 }
 
 type QueuedEvent = {
   name: string
   params: GA4Params
   timestamp: number
+  flags?: QueuedEventFlags
 }
 
 type PageViewDedupeState = {
@@ -275,9 +314,10 @@ type UniApi = {
   request?: (options: {
     url: string
     method: string
+    timeout?: number
     success: (response: { statusCode?: number }) => void
     fail: (error: unknown) => void
-  }) => void
+  }) => { abort?: () => void } | void
   getSystemInfoSync?: () => {
     language?: string
     screenWidth?: number
@@ -319,7 +359,7 @@ export function createUniAppGA4(config: CreateUniAppGA4Config): UniAppGA4 {
 }
 
 class UniAppGA4Client implements UniAppGA4 {
-  private readonly config: Required<Pick<CreateUniAppGA4Config, "measurementId" | "collectEndpoint" | "debug" | "autoPageView" | "autoViewSearchResults" | "autoUniInterceptors" | "autoHistory" | "autoFileDownload" | "autoOutboundClick" | "autoForm" | "autoScroll" | "sessionTimeoutMs" | "batchIntervalMs" | "storagePrefix" | "appOrigin" | "anonymizeIp" | "respectDoNotTrack" | "respectGlobalPrivacyControl" | "userIdPersistence">> & CreateUniAppGA4Config
+  private readonly config: Required<Pick<CreateUniAppGA4Config, "measurementId" | "collectEndpoint" | "debug" | "autoPageView" | "autoViewSearchResults" | "autoUniInterceptors" | "autoHistory" | "autoFileDownload" | "autoOutboundClick" | "autoForm" | "autoScroll" | "sessionTimeoutMs" | "batchIntervalMs" | "requestTimeoutMs" | "maxQueueSize" | "retryDelaysMs" | "persistQueue" | "maxPendingAgeMs" | "storagePrefix" | "appOrigin" | "anonymizeIp" | "respectDoNotTrack" | "respectGlobalPrivacyControl" | "userIdPersistence">> & CreateUniAppGA4Config
   private readonly storage: StorageDriver
   private readonly logger: Pick<Console, "debug" | "info" | "warn" | "error">
   private readonly queue: QueuedEvent[] = []
@@ -332,6 +372,10 @@ class UniAppGA4Client implements UniAppGA4 {
   private consent: ConsentState = {}
   private session: StoredSession
   private flushTimer: ReturnType<typeof setTimeout> | undefined
+  private flushPromise: Promise<void> | undefined
+  private retryTimer: ReturnType<typeof setTimeout> | undefined
+  private retryAttempt = 0
+  private pendingPersisted = false
   private hitSequence = 0
   private pageId = randomInt(100000000, 999999999)
   private lastPage: PageContext | undefined
@@ -341,6 +385,7 @@ class UniAppGA4Client implements UniAppGA4 {
   private uniInterceptorsRegistered = false
   private browserCollectorsRegistered = false
   private disabled = false
+  private destroyed = false
 
   constructor(config: CreateUniAppGA4Config) {
     if (!config.measurementId) {
@@ -361,6 +406,13 @@ class UniAppGA4Client implements UniAppGA4 {
       autoScroll: config.autoScroll ?? true,
       sessionTimeoutMs: config.sessionTimeoutMs ?? defaultSessionTimeoutMs,
       batchIntervalMs: config.batchIntervalMs ?? 0,
+      requestTimeoutMs: positiveOrDefault(config.requestTimeoutMs, defaultRequestTimeoutMs),
+      maxQueueSize: Math.max(1, Math.floor(positiveOrDefault(config.maxQueueSize, defaultMaxQueueSize))),
+      retryDelaysMs: Array.isArray(config.retryDelaysMs)
+        ? config.retryDelaysMs.filter((delay) => typeof delay === "number" && Number.isFinite(delay) && delay >= 0)
+        : defaultRetryDelaysMs,
+      persistQueue: config.persistQueue ?? true,
+      maxPendingAgeMs: positiveOrDefault(config.maxPendingAgeMs, defaultMaxPendingAgeMs),
       storagePrefix: config.storagePrefix || defaultStoragePrefix,
       appOrigin: normalizeAppOrigin(config.appOrigin),
       anonymizeIp: config.anonymizeIp ?? false,
@@ -378,6 +430,7 @@ class UniAppGA4Client implements UniAppGA4 {
       const storedUserId = this.readString("user_id")
       this.userId = storedUserId || undefined
     }
+    this.restorePendingEvents()
   }
 
   init() {
@@ -392,12 +445,21 @@ class UniAppGA4Client implements UniAppGA4 {
     if (this.config.autoPageView) {
       void this.trackAutoPageView("init")
     }
+    if (this.queue.length > 0) {
+      // Deliver hits that were persisted by a previous run and never reached GA.
+      void this.flush("restore")
+    }
   }
 
   destroy() {
+    this.destroyed = true
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
       this.flushTimer = undefined
+    }
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer)
+      this.retryTimer = undefined
     }
     while (this.cleanupTasks.length > 0) {
       const cleanup = this.cleanupTasks.pop()
@@ -435,6 +497,15 @@ class UniAppGA4Client implements UniAppGA4 {
   optOut(disabled: boolean) {
     this.disabled = disabled
     this.write("opt_out", disabled)
+    if (disabled) {
+      // Never deliver hits collected before the user opted out.
+      this.queue.length = 0
+      if (this.retryTimer) {
+        clearTimeout(this.retryTimer)
+        this.retryTimer = undefined
+      }
+      this.persistPendingEvents()
+    }
   }
 
   async event(name: GA4EventName, params: GA4Params = {}) {
@@ -446,7 +517,8 @@ class UniAppGA4Client implements UniAppGA4 {
     this.ensureSession()
     const engagementTime = this.consumeEngagementTime()
     const debugMode = params.debug_mode ?? this.config.debug
-    this.queue.push({
+    const flags = this.takeSessionFlags()
+    this.enqueue({
       name: eventName,
       params: {
         ...params,
@@ -455,11 +527,16 @@ class UniAppGA4Client implements UniAppGA4 {
         ...(debugMode ? { debug_mode: true } : {}),
       },
       timestamp: Date.now(),
+      ...(flags ? { flags } : {}),
     })
     this.persistSession()
 
     if (this.config.batchIntervalMs > 0) {
       this.scheduleFlush()
+      return
+    }
+    if (this.retryTimer) {
+      // A failed delivery is waiting for its backoff timer: keep the hit queued instead of hammering a broken network.
       return
     }
     await this.flush("event")
@@ -504,6 +581,8 @@ class UniAppGA4Client implements UniAppGA4 {
   }
 
   async appHide() {
+    // The process may be frozen or killed right after hiding, so snapshot anything still undelivered first.
+    this.persistPendingEvents()
     await this.flush("app-hide")
   }
 
@@ -512,6 +591,7 @@ class UniAppGA4Client implements UniAppGA4 {
   }
 
   async pageHide() {
+    this.persistPendingEvents()
     await this.flush("page-hide")
   }
 
@@ -623,20 +703,155 @@ class UniAppGA4Client implements UniAppGA4 {
       clearTimeout(this.flushTimer)
       this.flushTimer = undefined
     }
+    if (this.retryTimer) {
+      // An explicit flush supersedes the pending backoff timer; a failed attempt will re-arm it.
+      clearTimeout(this.retryTimer)
+      this.retryTimer = undefined
+    }
     if (this.disabled || this.queue.length === 0) {
-      return
+      return this.flushPromise
     }
 
-    const events = this.queue.splice(0)
-    for (const item of events) {
+    if (!this.flushPromise) {
+      // Single-flight: concurrent callers share one drain loop, so hits are delivered in order and never in parallel.
+      // The drain starts in a microtask so `flushPromise` is always assigned before any request code can re-enter `flush()`.
+      this.flushPromise = Promise.resolve()
+        .then(() => this.drainQueue())
+        .then(
+          (completed) => {
+            this.flushPromise = undefined
+            if (completed && this.queue.length > 0 && !this.disabled) {
+              // Hits enqueued while the last request was settling still need a delivery attempt.
+              void this.flush("drain")
+            }
+          },
+          (error) => {
+            this.flushPromise = undefined
+            this.logger.warn("ga4-uniapp flush crashed unexpectedly.", error)
+            this.scheduleRetry()
+          },
+        )
+    }
+    return this.flushPromise
+  }
+
+  /**
+   * Sends queued hits oldest-first. A hit leaves the queue only after it was delivered, so a failed
+   * request (or an app kill mid-request) never loses the hit itself or the hits queued behind it.
+   *
+   * @returns `true` when the queue was drained, `false` when delivery failed and a retry was scheduled.
+   */
+  private async drainQueue(): Promise<boolean> {
+    while (this.queue.length > 0 && !this.disabled) {
+      const item = this.queue[0]
+      if (Date.now() - item.timestamp > this.config.maxPendingAgeMs) {
+        this.logger.warn("ga4-uniapp dropped a hit that stayed undelivered longer than maxPendingAgeMs.", item.name)
+        this.removeQueuedEvent(item)
+        continue
+      }
       try {
         await this.sendEvent(item)
       } catch (error) {
-        this.logger.warn("ga4-uniapp failed to send event.", error)
-        this.queue.unshift(item)
-        break
+        this.logger.warn("ga4-uniapp failed to send event; it stays queued and will be retried.", item.name, error)
+        this.persistPendingEvents()
+        this.scheduleRetry()
+        return false
       }
+      this.removeQueuedEvent(item)
+      this.retryAttempt = 0
     }
+    this.persistPendingEvents()
+    return true
+  }
+
+  private enqueue(item: QueuedEvent) {
+    this.queue.push(item)
+    const overflow = this.queue.length - this.config.maxQueueSize
+    if (overflow > 0) {
+      this.queue.splice(0, overflow)
+      this.logger.warn(`ga4-uniapp dropped ${overflow} oldest undelivered hit(s) because maxQueueSize (${this.config.maxQueueSize}) was exceeded.`)
+    }
+  }
+
+  private removeQueuedEvent(item: QueuedEvent) {
+    // Look the hit up by identity: `maxQueueSize` overflow may already have dropped it while it was in flight.
+    const index = this.queue.indexOf(item)
+    if (index >= 0) {
+      this.queue.splice(index, 1)
+    }
+  }
+
+  private scheduleRetry() {
+    const delays = this.config.retryDelaysMs
+    if (this.retryTimer || this.destroyed || this.disabled || this.queue.length === 0 || delays.length === 0) {
+      return
+    }
+    const delay = delays[Math.min(this.retryAttempt, delays.length - 1)]
+    this.retryAttempt += 1
+    this.logger.debug("ga4-uniapp will retry delivery in", delay, "ms; undelivered hits:", this.queue.length)
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined
+      void this.flush("retry")
+    }, delay)
+  }
+
+  private persistPendingEvents() {
+    if (!this.config.persistQueue) {
+      return
+    }
+    if (this.queue.length === 0) {
+      if (this.pendingPersisted) {
+        this.remove("pending_events")
+        this.pendingPersisted = false
+      }
+      return
+    }
+    this.write("pending_events", this.queue.map(({ name, params, timestamp, flags }) => ({ name, params, timestamp, ...(flags ? { flags } : {}) })))
+    this.pendingPersisted = true
+  }
+
+  private restorePendingEvents() {
+    if (!this.config.persistQueue) {
+      return
+    }
+    const stored = this.storage.get(this.key("pending_events"))
+    if (!Array.isArray(stored) || stored.length === 0) {
+      return
+    }
+    if (this.disabled) {
+      // Opted-out clients must not deliver anything collected earlier.
+      this.remove("pending_events")
+      return
+    }
+
+    const now = Date.now()
+    const restored: QueuedEvent[] = []
+    for (const entry of stored) {
+      if (!entry || typeof entry !== "object") {
+        continue
+      }
+      const { name, params, timestamp, flags } = entry as Partial<QueuedEvent>
+      if (typeof name !== "string" || !name || !params || typeof params !== "object") {
+        continue
+      }
+      const queuedAt = typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : now
+      if (now - queuedAt > this.config.maxPendingAgeMs) {
+        continue
+      }
+      restored.push({
+        name,
+        params: params as GA4Params,
+        timestamp: queuedAt,
+        ...(flags && typeof flags === "object" ? { flags: { ss: flags.ss === true, nsi: flags.nsi === true, fv: flags.fv === true } } : {}),
+      })
+    }
+
+    if (restored.length === 0) {
+      this.remove("pending_events")
+      return
+    }
+    this.queue.push(...restored.slice(-this.config.maxQueueSize))
+    this.pendingPersisted = true
   }
 
   resetSession() {
@@ -929,21 +1144,41 @@ class UniAppGA4Client implements UniAppGA4 {
     const params = this.buildCollectParams(item)
     const url = appendQuery(this.config.collectEndpoint, params)
     this.logger.debug("ga4-uniapp collect", item.name, url)
-    const response = this.config.requestAdapter
-      ? await this.config.requestAdapter({
-        url,
-        method: "GET",
-        eventName: item.name,
-        params,
-      })
-      : await defaultRequestAdapter({
-        url,
-        method: "GET",
-        eventName: item.name,
-        params,
-      })
+    const request: UniGA4HttpRequest = {
+      url,
+      method: "GET",
+      eventName: item.name,
+      params,
+      timeoutMs: this.config.requestTimeoutMs,
+    }
+    const response = await this.requestWithDeadline(request)
+    if (this.config.debug) {
+      this.logger.debug("ga4-uniapp collect response", item.name, response.ok ? "ok" : "failed", response.statusCode ?? safeStringify(response.raw))
+    }
     if (!response.ok) {
       throw new Error(`GA4 collect returned ${response.statusCode || "a transport error"}.`)
+    }
+  }
+
+  /**
+   * Runs the transport with a hard deadline so a custom adapter that never settles cannot wedge the delivery queue.
+   * The default adapter enforces `requestTimeoutMs` itself; this is the backstop for every adapter.
+   */
+  private async requestWithDeadline(request: UniGA4HttpRequest): Promise<UniGA4HttpResponse> {
+    const adapter = this.config.requestAdapter || defaultRequestAdapter
+    const deadlineMs = this.config.requestTimeoutMs + 1000
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        adapter(request),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`GA4 collect timed out after ${deadlineMs}ms.`)), deadlineMs)
+        }),
+      ])
+    } finally {
+      if (timer) {
+        clearTimeout(timer)
+      }
     }
   }
 
@@ -978,9 +1213,27 @@ class UniAppGA4Client implements UniAppGA4 {
     if (this.consent.ad_personalization === "DENIED") {
       params.npa = "1"
     }
+    if (item.flags?.ss) {
+      params._ss = "1"
+    }
+    if (item.flags?.nsi) {
+      params._nsi = "1"
+    }
+    if (item.flags?.fv) {
+      params._fv = "1"
+    }
 
     Object.entries(item.params).forEach(([key, value]) => {
       if (value === undefined || value === null || !isAllowedParamName(key)) {
+        return
+      }
+      if (key === "debug_mode") {
+        // GA4 DebugView identifies debug devices through the `debug_mode` *event parameter*,
+        // which gtag.js serializes as `ep.debug_mode=true`. The legacy `_dbg=1` flag is kept as well.
+        if (isEnabledFlag(value)) {
+          params["ep.debug_mode"] = "true"
+          params._dbg = "1"
+        }
         return
       }
       const mappedKey = mapReservedParamName(key)
@@ -1024,6 +1277,27 @@ class UniAppGA4Client implements UniAppGA4 {
     }
   }
 
+  /**
+   * Returns the session markers for the hit that is about to be queued, and records that they were handed out.
+   *
+   * gtag.js flags the first hit of every session with `_ss`/`_nsi` (and the very first hit of a new client with
+   * `_fv`); GA4 derives `session_start` and `first_visit` from them. Hits without these markers are still recorded
+   * as events, but GA4 never sees a session start, so sessions and new users stay at zero for the stream.
+   */
+  private takeSessionFlags(): QueuedEventFlags | undefined {
+    const flags: QueuedEventFlags = {}
+    if (!this.session.startSent) {
+      flags.ss = true
+      flags.nsi = true
+      this.session.startSent = true
+    }
+    if (this.readBoolean("first_visit_pending")) {
+      flags.fv = true
+      this.remove("first_visit_pending")
+    }
+    return flags.ss || flags.nsi || flags.fv ? flags : undefined
+  }
+
   private consumeEngagementTime() {
     const now = Date.now()
     const elapsed = Math.max(1, now - this.session.lastEngagementTs)
@@ -1040,6 +1314,8 @@ class UniAppGA4Client implements UniAppGA4 {
     }
     const created = `${randomInt(1000000000, 9999999999)}.${Math.floor(Date.now() / 1000)}`
     this.write("client_id", created)
+    // Only brand-new clients get `_fv=1`; clients created by older SDK versions must not be counted as new users.
+    this.write("first_visit_pending", true)
     if (!this.readNumber("install_time")) {
       this.write("install_time", Date.now())
     }
@@ -1265,19 +1541,51 @@ async function defaultRequestAdapter(req: UniGA4HttpRequest): Promise<UniGA4Http
   }
 
   return new Promise((resolve) => {
-    request({
+    const timeoutMs = typeof req.timeoutMs === "number" && req.timeoutMs > 0 ? req.timeoutMs : undefined
+    let settled = false
+    let guard: ReturnType<typeof setTimeout> | undefined
+    let task: { abort?: () => void } | undefined | void
+    const settle = (result: UniGA4HttpResponse) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (guard) {
+        clearTimeout(guard)
+      }
+      resolve(result)
+    }
+
+    if (timeoutMs) {
+      // Some uni runtimes ignore the `timeout` option, and a black-holed connection would otherwise hang the
+      // whole delivery queue, so the deadline is enforced here as well.
+      guard = setTimeout(() => {
+        try {
+          task?.abort?.()
+        } catch {
+          // Ignore abort failures; the hit is retried anyway.
+        }
+        settle({
+          ok: false,
+          raw: { errMsg: `request:fail timeout ${timeoutMs}ms` },
+        })
+      }, timeoutMs + 500)
+    }
+
+    task = request({
       url: req.url,
       method: req.method,
+      ...(timeoutMs ? { timeout: timeoutMs } : {}),
       success(response: { statusCode?: number }) {
         const statusCode = response.statusCode || 0
-        resolve({
+        settle({
           ok: statusCode >= 200 && statusCode < 400,
           statusCode,
           raw: response,
         })
       },
       fail(error: unknown) {
-        resolve({
+        settle({
           ok: false,
           raw: error,
         })
@@ -1286,8 +1594,20 @@ async function defaultRequestAdapter(req: UniGA4HttpRequest): Promise<UniGA4Http
   })
 }
 
+function positiveOrDefault(value: number | undefined, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
 function getUniApi(): UniApi | undefined {
   return (globalThis as typeof globalThis & { uni?: UniApi }).uni
+}
+
+function safeStringify(value: unknown) {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
 function appendQuery(endpoint: string, params: Record<string, string>) {
@@ -1307,9 +1627,12 @@ function mapReservedParamName(key: string) {
     screen_resolution: "sr",
     session_id: "sid",
     engagement_time_msec: "_et",
-    debug_mode: "_dbg",
   }
   return mapping[key]
+}
+
+function isEnabledFlag(value: GA4Value) {
+  return value === true || value === 1 || value === "1" || (typeof value === "string" && value.toLowerCase() === "true")
 }
 
 function stringifyParamValue(value: GA4Value) {

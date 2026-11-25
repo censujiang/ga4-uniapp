@@ -750,6 +750,60 @@
             },
             {
               "kind": "PropertySignature",
+              "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#maxPendingAgeMs:member",
+              "docComment": "/**\n * Drop undelivered hits older than this many milliseconds instead of retrying them. Defaults to 24 hours.\n */\n",
+              "excerptTokens": [
+                {
+                  "kind": "Content",
+                  "text": "maxPendingAgeMs?: "
+                },
+                {
+                  "kind": "Content",
+                  "text": "number"
+                },
+                {
+                  "kind": "Content",
+                  "text": ";"
+                }
+              ],
+              "isReadonly": false,
+              "isOptional": true,
+              "releaseTag": "Public",
+              "name": "maxPendingAgeMs",
+              "propertyTypeTokenRange": {
+                "startIndex": 1,
+                "endIndex": 2
+              }
+            },
+            {
+              "kind": "PropertySignature",
+              "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#maxQueueSize:member",
+              "docComment": "/**\n * Maximum number of undelivered hits kept in memory/storage. The oldest hits are dropped first. Defaults to 100.\n */\n",
+              "excerptTokens": [
+                {
+                  "kind": "Content",
+                  "text": "maxQueueSize?: "
+                },
+                {
+                  "kind": "Content",
+                  "text": "number"
+                },
+                {
+                  "kind": "Content",
+                  "text": ";"
+                }
+              ],
+              "isReadonly": false,
+              "isOptional": true,
+              "releaseTag": "Public",
+              "name": "maxQueueSize",
+              "propertyTypeTokenRange": {
+                "startIndex": 1,
+                "endIndex": 2
+              }
+            },
+            {
+              "kind": "PropertySignature",
               "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#measurementId:member",
               "docComment": "/**\n * GA4 Measurement ID, for example `G-XXXXXXXXXX`.\n */\n",
               "excerptTokens": [
@@ -770,6 +824,33 @@
               "isOptional": false,
               "releaseTag": "Public",
               "name": "measurementId",
+              "propertyTypeTokenRange": {
+                "startIndex": 1,
+                "endIndex": 2
+              }
+            },
+            {
+              "kind": "PropertySignature",
+              "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#persistQueue:member",
+              "docComment": "/**\n * Persist undelivered hits through uni storage so they survive app restarts. Defaults to `true`.\n */\n",
+              "excerptTokens": [
+                {
+                  "kind": "Content",
+                  "text": "persistQueue?: "
+                },
+                {
+                  "kind": "Content",
+                  "text": "boolean"
+                },
+                {
+                  "kind": "Content",
+                  "text": ";"
+                }
+              ],
+              "isReadonly": false,
+              "isOptional": true,
+              "releaseTag": "Public",
+              "name": "persistQueue",
               "propertyTypeTokenRange": {
                 "startIndex": 1,
                 "endIndex": 2
@@ -831,6 +912,33 @@
             },
             {
               "kind": "PropertySignature",
+              "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#requestTimeoutMs:member",
+              "docComment": "/**\n * Per-request timeout in milliseconds for the default `uni.request` transport.\n *\n * Defaults to 10 seconds, so a blocked or black-holed network path fails fast and the hit is retried instead of hanging for the platform default (typically 60 seconds).\n */\n",
+              "excerptTokens": [
+                {
+                  "kind": "Content",
+                  "text": "requestTimeoutMs?: "
+                },
+                {
+                  "kind": "Content",
+                  "text": "number"
+                },
+                {
+                  "kind": "Content",
+                  "text": ";"
+                }
+              ],
+              "isReadonly": false,
+              "isOptional": true,
+              "releaseTag": "Public",
+              "name": "requestTimeoutMs",
+              "propertyTypeTokenRange": {
+                "startIndex": 1,
+                "endIndex": 2
+              }
+            },
+            {
+              "kind": "PropertySignature",
               "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#respectDoNotTrack:member",
               "docComment": "/**\n * Respect browser Do Not Track when available.\n */\n",
               "excerptTokens": [
@@ -878,6 +986,33 @@
               "isOptional": true,
               "releaseTag": "Public",
               "name": "respectGlobalPrivacyControl",
+              "propertyTypeTokenRange": {
+                "startIndex": 1,
+                "endIndex": 2
+              }
+            },
+            {
+              "kind": "PropertySignature",
+              "canonicalReference": "ga4-uniapp!CreateUniAppGA4Config#retryDelaysMs:member",
+              "docComment": "/**\n * Delays in milliseconds between delivery retries after a failed request; the last value repeats.\n *\n * Defaults to `[2000, 5000, 15000, 30000, 60000]`. Pass an empty array to disable timed retries (undelivered hits are still retried on the next flush trigger).\n */\n",
+              "excerptTokens": [
+                {
+                  "kind": "Content",
+                  "text": "retryDelaysMs?: "
+                },
+                {
+                  "kind": "Content",
+                  "text": "number[]"
+                },
+                {
+                  "kind": "Content",
+                  "text": ";"
+                }
+              ],
+              "isReadonly": false,
+              "isOptional": true,
+              "releaseTag": "Public",
+              "name": "retryDelaysMs",
               "propertyTypeTokenRange": {
                 "startIndex": 1,
                 "endIndex": 2
@@ -2437,7 +2572,7 @@
             },
             {
               "kind": "Content",
-              "text": "<string, string>;\n}"
+              "text": "<string, string>;\n    timeoutMs?: number;\n}"
             },
             {
               "kind": "Content",

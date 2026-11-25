@@ -69,12 +69,43 @@ https://www.google-analytics.com/g/collect
 This is the GA4 web collect endpoint used by gtag-style browser hits. The SDK
 does not call `https://www.google-analytics.com/mp/collect` and does not use an
 API secret. Event parameters are encoded as query parameters such as `v=2`,
-`tid`, `cid`, `sid`, `sct`, `en`, `dl`, `dt`, `_dbg`, and `ep.*`.
+`tid`, `cid`, `sid`, `sct`, `en`, `dl`, `dt`, and `ep.*`. Like gtag.js, the
+first hit of every session also carries `_ss=1&_nsi=1` (and the first hit of a
+brand-new client `_fv=1`), which is how GA4 derives `session_start`,
+`first_visit`, sessions, and new users. When `debug` is enabled every hit also
+carries `ep.debug_mode=true` (what gtag.js sends) plus the legacy `_dbg=1`. GA4 DebugView only lists devices that send debug-flagged
+hits, so enable `debug` while verifying in DebugView (and reload the DebugView
+page / reopen its device dropdown, because the device list does not refresh by
+itself).
 
 By default, transport goes through `uni.request`, and persistence goes through
 `uni.getStorageSync`, `uni.setStorageSync`, and `uni.removeStorageSync`. The
 SDK default path does not use browser-only `Image`, `fetch`, or `localStorage`
 fallbacks.
+
+### Delivery reliability
+
+Hits are delivered oldest-first, one request at a time. A hit leaves the queue
+only after the collect endpoint answered with a 2xx/3xx status. A failed or
+timed-out request keeps the hit (and everything queued behind it) in the queue,
+persists the queue through uni storage, and retries with backoff. Hits that
+could not be delivered before the app was closed are delivered by the next
+`init()`.
+
+```ts
+createUniAppGA4({
+  measurementId: "G-XXXXXXXXXX",
+  requestTimeoutMs: 10_000, // per request, default 10s (fails fast on blocked networks)
+  retryDelaysMs: [2_000, 5_000, 15_000, 30_000, 60_000], // backoff, last value repeats; [] disables timed retries
+  maxQueueSize: 100, // oldest undelivered hits are dropped beyond this
+  persistQueue: true, // keep undelivered hits across app restarts
+  maxPendingAgeMs: 24 * 60 * 60 * 1000, // discard hits older than this instead of retrying
+})
+```
+
+If your users cannot reliably reach `www.google-analytics.com` (for example on
+mainland-China networks), point `collectEndpoint` at a first-party relay that
+forwards the query string to `https://www.google-analytics.com/g/collect`.
 
 默认端点是：
 
@@ -84,11 +115,36 @@ https://www.google-analytics.com/g/collect
 
 这是 GA4 Web 统计的 gtag 风格端点。SDK 不调用
 `https://www.google-analytics.com/mp/collect`，也不使用 API secret。事件参数会被编码成
-`v=2`、`tid`、`cid`、`sid`、`sct`、`en`、`dl`、`dt`、`_dbg`、`ep.*` 等查询参数。
+`v=2`、`tid`、`cid`、`sid`、`sct`、`en`、`dl`、`dt`、`ep.*` 等查询参数；与 gtag.js 一样，
+每个会话的第一个 hit 还会带上 `_ss=1&_nsi=1`（全新 client 的第一个 hit 带 `_fv=1`），
+GA4 正是靠它们生成 `session_start`、`first_visit` 以及会话数、新用户数。开启 `debug` 时每个
+hit 还会带上 `ep.debug_mode=true`（gtag.js 发送的就是它）以及旧的 `_dbg=1`。GA4 DebugView 只会列出发送了调试标记的设备，所以用 DebugView 验证时请开启
+`debug`（并且刷新 DebugView 页面 / 重新展开设备下拉框，因为设备列表不会自动刷新）。
 
 默认传输使用 `uni.request`，默认持久化使用 `uni.getStorageSync`、
 `uni.setStorageSync` 和 `uni.removeStorageSync`。SDK 默认路径不会走浏览器专属的
 `Image`、`fetch` 或 `localStorage` 兜底。
+
+### 投递可靠性
+
+hit 按先后顺序、一次一个请求地投递；只有收到 2xx/3xx 响应后才会从队列中移除。请求失败或
+超时时，该 hit（以及排在它后面的所有 hit）会继续留在队列里，队列会通过 uni 存储持久化，并按
+退避策略重试；应用关闭前没送出去的 hit 会在下一次 `init()` 时补发。
+
+```ts
+createUniAppGA4({
+  measurementId: "G-XXXXXXXXXX",
+  requestTimeoutMs: 10_000, // 单个请求超时，默认 10 秒（网络被屏蔽时快速失败）
+  retryDelaysMs: [2_000, 5_000, 15_000, 30_000, 60_000], // 退避间隔，最后一个值会重复；传 [] 关闭定时重试
+  maxQueueSize: 100, // 未送达 hit 的上限，超出时丢弃最旧的
+  persistQueue: true, // 跨应用重启保留未送达的 hit
+  maxPendingAgeMs: 24 * 60 * 60 * 1000, // 超过该时长的 hit 直接丢弃，不再重试
+})
+```
+
+如果你的用户无法稳定访问 `www.google-analytics.com`（例如中国大陆网络），可以把
+`collectEndpoint` 指向一个自有的中转服务，由它把查询串转发到
+`https://www.google-analytics.com/g/collect`。
 
 ## Automatic Collection
 
